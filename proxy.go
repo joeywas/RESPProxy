@@ -20,16 +20,25 @@ import (
 )
 
 type config struct {
-	listenAddress string
-	seeds         []string
-	redisUsername string
-	redisPassword string
-	redisTLS      bool
-	redisTimeout  time.Duration
-	proxyUsername string
-	proxyPassword string
-	debug         bool
+	listenAddress                   string
+	seeds                           []string
+	redisUsername                   string
+	redisPassword                   string
+	redisTLS                        bool
+	redisTimeout                    time.Duration
+	proxyUsername                   string
+	proxyPassword                   string
+	maxClients                      int
+	clientIdleTimeout               time.Duration
+	maxBackendConnectionsPerSession int
+	debug                           bool
 }
+
+const (
+	defaultMaxClients                      = 1000
+	defaultClientIdleTimeout               = 5 * time.Minute
+	defaultMaxBackendConnectionsPerSession = 16
+)
 
 type proxy struct {
 	config config
@@ -44,9 +53,10 @@ type proxy struct {
 }
 
 type backendConn struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	writer *bufio.Writer
+	conn     net.Conn
+	reader   *bufio.Reader
+	writer   *bufio.Writer
+	lastUsed time.Time
 }
 
 type clientSession struct {
@@ -59,12 +69,15 @@ type clientSession struct {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		listenAddress: envOr("LISTEN_ADDR", "127.0.0.1:6379"),
-		redisUsername: os.Getenv("REDIS_USERNAME"),
-		redisPassword: os.Getenv("REDIS_PASSWORD"),
-		proxyUsername: os.Getenv("PROXY_USERNAME"),
-		proxyPassword: os.Getenv("PROXY_PASSWORD"),
-		redisTimeout:  5 * time.Second,
+		listenAddress:                   envOr("LISTEN_ADDR", "127.0.0.1:6379"),
+		redisUsername:                   os.Getenv("REDIS_USERNAME"),
+		redisPassword:                   os.Getenv("REDIS_PASSWORD"),
+		proxyUsername:                   os.Getenv("PROXY_USERNAME"),
+		proxyPassword:                   os.Getenv("PROXY_PASSWORD"),
+		redisTimeout:                    5 * time.Second,
+		maxClients:                      defaultMaxClients,
+		clientIdleTimeout:               defaultClientIdleTimeout,
+		maxBackendConnectionsPerSession: defaultMaxBackendConnectionsPerSession,
 	}
 	if raw := strings.TrimSpace(os.Getenv("REDIS_CLUSTER_NODES")); raw != "" {
 		for _, seed := range strings.Split(raw, ",") {
@@ -101,6 +114,27 @@ func loadConfig() (config, error) {
 			return config{}, errors.New("REDIS_TIMEOUT must be a positive Go duration, such as 5s")
 		}
 		cfg.redisTimeout = timeout
+	}
+	if raw := strings.TrimSpace(os.Getenv("MAX_CLIENTS")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit <= 0 {
+			return config{}, errors.New("MAX_CLIENTS must be a positive integer")
+		}
+		cfg.maxClients = limit
+	}
+	if raw := strings.TrimSpace(os.Getenv("CLIENT_IDLE_TIMEOUT")); raw != "" {
+		timeout, err := time.ParseDuration(raw)
+		if err != nil || timeout <= 0 {
+			return config{}, errors.New("CLIENT_IDLE_TIMEOUT must be a positive Go duration, such as 5m")
+		}
+		cfg.clientIdleTimeout = timeout
+	}
+	if raw := strings.TrimSpace(os.Getenv("MAX_BACKEND_CONNECTIONS_PER_SESSION")); raw != "" {
+		limit, err := strconv.Atoi(raw)
+		if err != nil || limit <= 0 {
+			return config{}, errors.New("MAX_BACKEND_CONNECTIONS_PER_SESSION must be a positive integer")
+		}
+		cfg.maxBackendConnectionsPerSession = limit
 	}
 	return cfg, nil
 }
@@ -360,14 +394,36 @@ func parseRedirect(message []byte) (string, error) {
 
 func (s *clientSession) backend(p *proxy, address string) (*backendConn, error) {
 	if backend := s.backends[address]; backend != nil {
+		backend.lastUsed = time.Now()
 		return backend, nil
+	}
+	if p.config.maxBackendConnectionsPerSession <= 0 {
+		return nil, errors.New("backend connection limit must be positive")
+	}
+	if len(s.backends) >= p.config.maxBackendConnectionsPerSession {
+		s.evictLeastRecentlyUsedBackend()
 	}
 	backend, err := p.dialBackend(address)
 	if err != nil {
 		return nil, err
 	}
+	backend.lastUsed = time.Now()
 	s.backends[address] = backend
 	return backend, nil
+}
+
+func (s *clientSession) evictLeastRecentlyUsedBackend() {
+	oldestAddress := ""
+	var oldestTime time.Time
+	for address, backend := range s.backends {
+		if oldestAddress == "" || backend.lastUsed.Before(oldestTime) {
+			oldestAddress = address
+			oldestTime = backend.lastUsed
+		}
+	}
+	if oldestAddress != "" {
+		s.dropBackend(oldestAddress)
+	}
 }
 
 func (s *clientSession) dropBackend(address string) {
@@ -393,6 +449,9 @@ func (p *proxy) serveClient(conn net.Conn) {
 	}()
 
 	for {
+		if err := conn.SetReadDeadline(time.Now().Add(p.config.clientIdleTimeout)); err != nil {
+			return
+		}
 		args, err := readCommand(session.reader)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !isClientDisconnect(err) {
@@ -557,17 +616,24 @@ func (p *proxy) listenAndServe(ctx context.Context, ready chan<- error) error {
 			}
 			return err
 		}
-		p.addClient(conn)
+		if !p.addClient(conn) {
+			_ = conn.Close()
+			continue
+		}
 		go p.serveClient(conn)
 	}
 	return nil
 }
 
-func (p *proxy) addClient(conn net.Conn) {
+func (p *proxy) addClient(conn net.Conn) bool {
 	p.clientsMu.Lock()
+	defer p.clientsMu.Unlock()
+	if p.config.maxClients <= 0 || len(p.clients) >= p.config.maxClients {
+		return false
+	}
 	p.clients[conn] = struct{}{}
 	p.clientsWG.Add(1)
-	p.clientsMu.Unlock()
+	return true
 }
 
 func (p *proxy) removeClient(conn net.Conn) {
