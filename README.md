@@ -18,6 +18,9 @@ Configure the proxy with environment variables:
 | `REDIS_TIMEOUT` | No | Backend connection and command timeout as a Go duration; defaults to `5s`. |
 | `PROXY_USERNAME` | No | Username clients must use when authenticating to the proxy. Requires `PROXY_PASSWORD`. |
 | `PROXY_PASSWORD` | No | Password clients must use to authenticate to the proxy. |
+| `MAX_CLIENTS` | No | Maximum concurrent client connections; defaults to `1000`. Excess connections are closed. |
+| `CLIENT_IDLE_TIMEOUT` | No | Maximum time to wait for a complete client request; defaults to `5m`. |
+| `MAX_BACKEND_CONNECTIONS_PER_SESSION` | No | Maximum backend connections retained per client session; defaults to `16`. The least recently used connection is closed when the limit is reached. |
 
 For example, in PowerShell:
 
@@ -35,7 +38,7 @@ To print one console line for each successful command, start RESPProxy interacti
 
 Debug output includes the command name and elapsed time only; it does not print keys, arguments, session values, or credentials. This switch is for interactive console runs and is not available with Windows service management commands. Services continue to write their operational logs to Windows Event Viewer.
 
-For testing on wtdotappl82.odot.state.or.us
+For testing on a Windows server
 
 ```powershell
 $env:REDIS_CLUSTER_NODES = "10.0.0.25:6379,10.0.0.25:6380,10.0.0.25:6384,10.0.0.26:6382,10.0.0.26:6383,10.0.0.26:6381"
@@ -80,8 +83,8 @@ Using Servy powershell module to install RESPProxy as a service.
 [Environment]::SetEnvironmentVariable("LISTEN_ADDR", "127.0.0.1:6378", "Machine")
 Import-Module "D:\Program Files\Servy\Servy.psm1" -Force
 $installParams = @{
-    Name = "ODOT.RESPProxy"
-    DisplayName = "ODOT.RESPProxy"
+    Name = "RESPProxy"
+    DisplayName = "RESPProxy"
     Description = "REDIS Protocol Proxy for Coldfusion"
     Path = "D:\RESPProxy\RESPProxy.exe"
     StartupDir = "D:\RESPProxy\"
@@ -103,5 +106,5 @@ The service process does not inherit environment variables set only in an intera
 
 ```powershell
 Import-Module "D:\Program Files\Servy\Servy.psm1" -Force
-Uninstall-ServyService 'ODOT.RESPProxy'
+Uninstall-ServyService 'RESPProxy'
 ```

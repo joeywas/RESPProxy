@@ -1,4 +1,4 @@
-module github.com/OrDOT-ISB/ColdFusion/RESPProxy
+module github.com/joeywas/RESPProxy
 
 go 1.22
 

@@ -38,6 +38,108 @@ func TestParseDebugFlag(t *testing.T) {
 	}
 }
 
+func TestLoadConfigClientLimits(t *testing.T) {
+	for _, key := range []string{
+		"REDIS_CLUSTER_NODES", "MAX_CLIENTS", "CLIENT_IDLE_TIMEOUT",
+		"MAX_BACKEND_CONNECTIONS_PER_SESSION", "REDIS_USERNAME", "REDIS_PASSWORD",
+		"PROXY_USERNAME", "PROXY_PASSWORD", "REDIS_TLS", "REDIS_TIMEOUT",
+	} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("REDIS_CLUSTER_NODES", "127.0.0.1:6379")
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.maxClients != defaultMaxClients || cfg.clientIdleTimeout != defaultClientIdleTimeout ||
+		cfg.maxBackendConnectionsPerSession != defaultMaxBackendConnectionsPerSession {
+		t.Fatalf("default limits = (%d, %s, %d), want (%d, %s, %d)",
+			cfg.maxClients, cfg.clientIdleTimeout, cfg.maxBackendConnectionsPerSession,
+			defaultMaxClients, defaultClientIdleTimeout, defaultMaxBackendConnectionsPerSession)
+	}
+
+	t.Setenv("MAX_CLIENTS", "42")
+	t.Setenv("CLIENT_IDLE_TIMEOUT", "2m")
+	t.Setenv("MAX_BACKEND_CONNECTIONS_PER_SESSION", "8")
+	cfg, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.maxClients != 42 || cfg.clientIdleTimeout != 2*time.Minute || cfg.maxBackendConnectionsPerSession != 8 {
+		t.Fatalf("configured limits = (%d, %s, %d), want (42, 2m, 8)",
+			cfg.maxClients, cfg.clientIdleTimeout, cfg.maxBackendConnectionsPerSession)
+	}
+}
+
+func TestClientLimitRejectsExcessConnections(t *testing.T) {
+	proxy := &proxy{config: config{maxClients: 1}, clients: make(map[net.Conn]struct{})}
+	first, firstPeer := net.Pipe()
+	defer firstPeer.Close()
+	if !proxy.addClient(first) {
+		t.Fatal("addClient() rejected the first client")
+	}
+	second, secondPeer := net.Pipe()
+	defer second.Close()
+	defer secondPeer.Close()
+	if proxy.addClient(second) {
+		t.Fatal("addClient() accepted a client above the configured limit")
+	}
+	proxy.removeClient(first)
+	proxy.clientsWG.Done()
+	_ = first.Close()
+}
+
+func TestClientIdleTimeoutClosesConnection(t *testing.T) {
+	proxy := &proxy{
+		config:  config{maxClients: 1, clientIdleTimeout: 25 * time.Millisecond},
+		clients: make(map[net.Conn]struct{}),
+	}
+	server, client := net.Pipe()
+	defer client.Close()
+	if !proxy.addClient(server) {
+		t.Fatal("addClient() rejected the client")
+	}
+	finished := make(chan struct{})
+	go func() {
+		proxy.serveClient(server)
+		close(finished)
+	}()
+	if err := client.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Read(make([]byte, 1)); err == nil {
+		t.Fatal("client connection remained open after the idle timeout")
+	}
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("client session did not finish after the idle timeout")
+	}
+}
+
+func TestBackendLimitEvictsLeastRecentlyUsedConnection(t *testing.T) {
+	oldConnection, oldPeer := net.Pipe()
+	defer oldPeer.Close()
+	recentConnection, recentPeer := net.Pipe()
+	defer recentPeer.Close()
+	session := &clientSession{backends: map[string]*backendConn{
+		"old":    {conn: oldConnection, lastUsed: time.Now().Add(-time.Minute)},
+		"recent": {conn: recentConnection, lastUsed: time.Now()},
+	}}
+
+	session.evictLeastRecentlyUsedBackend()
+	if _, exists := session.backends["old"]; exists {
+		t.Fatal("least-recently-used backend was not evicted")
+	}
+	if _, exists := session.backends["recent"]; !exists {
+		t.Fatal("more recently used backend was evicted")
+	}
+	if _, err := oldPeer.Write([]byte("x")); err == nil {
+		t.Fatal("evicted backend connection remained open")
+	}
+}
+
 func TestWriteDebugOperationDoesNotIncludeCommandArguments(t *testing.T) {
 	var output bytes.Buffer
 	if err := writeDebugOperation(&output, "HSET", time.Now()); err != nil {
@@ -87,7 +189,7 @@ func TestListenerStopsAndClosesClients(t *testing.T) {
 	}
 
 	p := &proxy{
-		config:  config{listenAddress: address},
+		config:  config{listenAddress: address, maxClients: 1, clientIdleTimeout: time.Minute},
 		clients: make(map[net.Conn]struct{}),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
