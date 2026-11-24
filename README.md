@@ -1,5 +1,11 @@
 # RESPProxy
 
+This was created to fill a niche role:
+
+- Run on Windows (Check out EnvoyProxy if on Linux)
+- Accept RESP2 connections from Adobe Coldfusion External Session storage feature
+- Proxy connections to a sharded Redis cluster
+
 RESPProxy accepts RESP2 client connections and routes a limited, explicit set of Redis commands to the correct Redis Cluster node. It is intended as a compatibility bridge for clients such as ColdFusion's `redissessionstorage` package that connect to one standalone-style Redis endpoint.
 
 Session values are passed through unchanged. The proxy does not implement Redis storage itself, and it does not make cluster-wide operations appear standalone. Commands outside the supported set are rejected.
@@ -38,26 +44,21 @@ To print one console line for each successful command, start RESPProxy interacti
 
 Debug output includes the command name and elapsed time only; it does not print keys, arguments, session values, or credentials. This switch is for interactive console runs and is not available with Windows service management commands. Services continue to write their operational logs to Windows Event Viewer.
 
-For testing on a Windows server
-
-```powershell
-$env:REDIS_CLUSTER_NODES = "10.0.0.25:6379,10.0.0.25:6380,10.0.0.25:6384,10.0.0.26:6382,10.0.0.26:6383,10.0.0.26:6381"
-$env:REDIS_CLUSTER_NODES = "10.0.0.25:6379"
-$env:LISTEN_ADDR = "127.0.0.1:6378"
-& D:\RESPProxy\RESPProxy.exe
-```
-
-Use the proxy's listener address in ColdFusion. If client authentication is configured, configure ColdFusion with the proxy credentials. Backend credentials are configured separately. Bind the listener only to a network reachable by trusted clients.
-
 The proxy loads its slot map using `CLUSTER SLOTS` at startup and follows `MOVED` and `ASK` redirects. Every node address advertised by the cluster must be reachable from the proxy.
 
 ## Supported commands
 
-The initial session-oriented command set includes the observed commands `DEL`, `HSET`, `SADD`, `SET`, `HGET`, `SISMEMBER`, and `PING`, plus commonly used string, hash, set, list, sorted-set, key-expiration, and key-inspection commands. The current explicit allowlist is in [`routing.go`](./routing.go).
+The explicit routed allowlist is in [`routing.go`](./routing.go). It includes these single-key commands:
 
-`AUTH` is handled against optional proxy credentials; backend authentication is independent. `SELECT 0` is accepted as a no-op and other database numbers are rejected. Basic `CLIENT SETNAME`, `CLIENT GETNAME`, and `CLIENT SETINFO` metadata operations are handled locally.
+`APPEND`, `BITCOUNT`, `BITFIELD`, `DECR`, `DECRBY`, `DUMP`, `EXPIRE`, `EXPIREAT`, `EXPIRETIME`, `GET`, `GETBIT`, `GETDEL`, `GETEX`, `GETRANGE`, `GETSET`, `HDEL`, `HEXISTS`, `HGET`, `HGETALL`, `HINCRBY`, `HINCRBYFLOAT`, `HKEYS`, `HLEN`, `HMGET`, `HMSET`, `HSCAN`, `HSET`, `HSETNX`, `HSTRLEN`, `HVALS`, `INCR`, `INCRBY`, `INCRBYFLOAT`, `LINDEX`, `LINSERT`, `LLEN`, `LPOP`, `LPOS`, `LPUSH`, `LPUSHX`, `LRANGE`, `LREM`, `LSET`, `LTRIM`, `PERSIST`, `PEXPIRE`, `PEXPIREAT`, `PEXPIRETIME`, `PFADD`, `PTTL`, `PSETEX`, `RESTORE`, `RPOP`, `RPUSH`, `RPUSHX`, `SADD`, `SCARD`, `SET`, `SETBIT`, `SETEX`, `SETNX`, `SETRANGE`, `SISMEMBER`, `SMEMBERS`, `SMISMEMBER`, `SPOP`, `SRANDMEMBER`, `SREM`, `SSCAN`, `STRLEN`, `SUBSTR`, `TTL`, `TYPE`, `ZADD`, `ZCARD`, `ZCOUNT`, `ZINCRBY`, `ZLEXCOUNT`, `ZPOPMAX`, `ZPOPMIN`, `ZRANGE`, `ZRANGEBYSCORE`, `ZRANGEBYLEX`, `ZRANK`, `ZREM`, `ZREMRANGEBYLEX`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZREVRANGE`, `ZREVRANGEBYSCORE`, `ZREVRANK`, `ZSCAN`, `ZSCORE`, `ZMSCORE`.
 
-Multi-key commands are routed only when all keys are in the same Redis Cluster hash slot. The proxy rejects cross-slot requests; it does not split a command into multiple operations. `SCAN`, `KEYS`, blocking commands, transactions, scripts, Pub/Sub, and cluster-wide administrative operations are not supported. Expand the allowlist only with correct key-position routing and tests for the command's cluster semantics.
+The allowlist also includes the multi-key commands `DEL`, `EXISTS`, `MGET`, `TOUCH`, `UNLINK`, `SDIFF`, `SINTER`, `SUNION`, and `PFCOUNT`; the key/value pair commands `MSET` and `MSETNX`; the two-key commands `RENAME`, `RENAMENX`, `SMOVE`, `RPOPLPUSH`, and `LMOVE`; and `SDIFFSTORE`, `SINTERSTORE`, `SUNIONSTORE`, `PFMERGE`, and `BITOP` for destination/source routing.
+
+`PING`, `ECHO`, `INFO`, `TIME`, and `COMMAND` are allowed without a key.
+
+`AUTH` is handled against optional proxy credentials; backend authentication is independent. `SELECT 0` is accepted as a no-op and other database numbers are rejected. `QUIT` closes the client connection. `CLIENT SETNAME`, `CLIENT GETNAME`, and `CLIENT SETINFO` for `LIB-NAME` or `LIB-VER` are handled locally; other `CLIENT` subcommands are rejected.
+
+Multi-key, pair, destination/source, and two-key commands are routed only when all routed keys are in the same Redis Cluster hash slot. The proxy rejects cross-slot requests; it does not split a command into multiple operations. Cluster-wide `SCAN`, `KEYS`, blocking commands, transactions, scripts, Pub/Sub, and cluster administrative operations are not supported. Key-specific `HSCAN`, `SSCAN`, and `ZSCAN` are supported.
 
 The proxy speaks RESP2 to clients and backends. RESP3 handshakes such as `HELLO 3` are not supported in this initial version.
 
@@ -73,34 +74,6 @@ Run a single test, for example:
 ```powershell
 go test -run '^TestRedisSlot$' .
 ```
-
-## Windows service
-
-Using Servy powershell module to install RESPProxy as a service.
-
-```powershell
-[Environment]::SetEnvironmentVariable("REDIS_CLUSTER_NODES", "10.0.0.25:6379", "Machine")
-[Environment]::SetEnvironmentVariable("LISTEN_ADDR", "127.0.0.1:6378", "Machine")
-Import-Module "D:\Program Files\Servy\Servy.psm1" -Force
-$installParams = @{
-    Name = "RESPProxy"
-    DisplayName = "RESPProxy"
-    Description = "REDIS Protocol Proxy for Coldfusion"
-    Path = "D:\RESPProxy\RESPProxy.exe"
-    StartupDir = "D:\RESPProxy\"
-    Stdout = "D:\RESPProxy\stdout_respproxy.log"
-    Stderr = "D:\RESPProxy\stderr_respproxy.log"
-    EnableSizeRotation = $true
-    RotationSize = 5
-    MaxRotations = 7
-    StartupType = "Automatic"
-}
-Install-ServyService @installParams
-```
-
-The installed service starts automatically with Windows and runs as the least-privilege `NT AUTHORITY\LocalService` account. It writes service logs to Windows Event Viewer under the `RESPProxy` source and is configured to restart after failures. Find logs under **Event Viewer > Windows Logs > Application**. Service stop and Windows shutdown controls close the listener and active client connections before the process exits.
-
-The service process does not inherit environment variables set only in an interactive PowerShell session. Set its required configuration in the machine environment before starting it; restart the service after changing configuration. Treat machine-level environment variables containing passwords as sensitive. 
 
 ### Uninstall
 
